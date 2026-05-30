@@ -1,0 +1,16 @@
+# Read-reclaim verification — STEP 1: populate valid pages.
+# Read disturb/reclaim only affects blocks holding VALID data, so the test
+# region must be written before the read loop. Run once before rr-seq-read.
+#
+#   sudo DEV=/dev/nvme0n1 RR_SIZE=2g fio rr-prep-write.fio
+[global]
+filename=${DEV}
+buffered=0
+ioengine=psync
+direct=1
+
+[prep-write]
+rw=write
+bs=128k
+offset=0
+size=${RR_SIZE}

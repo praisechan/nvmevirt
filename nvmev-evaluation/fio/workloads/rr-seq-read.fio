@@ -1,0 +1,25 @@
+# Read-reclaim verification — STEP 2: looping sequential read.
+# Re-reads the same small region for RR_RUNTIME seconds so each physical block's
+# read counter climbs fast and crosses the (low) reclaim threshold repeatedly.
+# The per-second bandwidth log (rr-read_bw.*.log) shows the dips when reclaim fires.
+#
+#   sudo DEV=/dev/nvme0n1 RR_SIZE=2g RR_RUNTIME=180 fio rr-seq-read.fio
+#
+# Baseline (no reclaim, or RRT very high): bandwidth is flat.
+# With reclaim at a low threshold: periodic bandwidth drops as valid-page copies
+# + erases contend with host reads.
+[global]
+filename=${DEV}
+buffered=0
+ioengine=psync
+direct=1
+time_based=1
+runtime=${RR_RUNTIME}
+
+[seq-read-loop]
+rw=read
+bs=128k
+offset=0
+size=${RR_SIZE}
+write_bw_log=rr-read
+log_avg_msec=1000
