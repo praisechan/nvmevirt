@@ -351,6 +351,8 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 
 	init_write_flow_control(conv_ftl);
 
+	conv_ftl->read_reclaim_cnt = 0;
+
 	NVMEV_INFO("Init FTL instance with %d channels (%ld pages)\n", conv_ftl->ssd->sp.nchs,
 		   conv_ftl->ssd->sp.tt_pgs);
 
@@ -574,6 +576,7 @@ static void mark_block_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	blk->ipc = 0;
 	blk->vpc = 0;
 	blk->erase_cnt++;
+	blk->read_cnt = 0; /* erase wipes accumulated read disturb */
 }
 
 static void gc_read_page(struct conv_ftl *conv_ftl, struct ppa *ppa)
@@ -821,6 +824,136 @@ static void foreground_gc(struct conv_ftl *conv_ftl)
 	}
 }
 
+/*
+ * Read reclaim (read-disturb mitigation) -- research doc Section 6.2 Option A:
+ * the counter is per physical nand_block (true to hardware), but the reclaim
+ * unit is the line/superblock, reusing the existing GC relocate+erase machinery.
+ * A block's read_cnt crossed READ_RECLAIM_THRESHOLD, so relocate every valid page
+ * in its line to fresh pages and erase the whole line (which resets every block's
+ * read_cnt via mark_block_free). Mirrors do_gc() but for one specific, externally
+ * selected line rather than the greedy valid-page-count victim.
+ */
+static void read_reclaim_line(struct conv_ftl *conv_ftl, struct line *line)
+{
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	struct line_mgmt *lm = &conv_ftl->lm;
+	struct ppa ppa;
+	int flashpg;
+	int copied = line->vpc; /* for logging; reset to 0 by mark_line_free below */
+
+	/* Never reclaim a line still being written into (it is on no
+	 * full/victim list, and erasing it would corrupt the active write pointer). */
+	if (line == conv_ftl->wp.curline || line == conv_ftl->gc_wp.curline)
+		return;
+
+	/* Relocating this line's valid pages consumes free pages; the gc write
+	 * pointer may need to roll onto a fresh line. Keep the same safety margin
+	 * GC uses (gc_thres_lines) so get_next_free_line() can never run dry and
+	 * trip the curline assert. The victim is freed below, so this is net-neutral. */
+	if (lm->free_line_cnt <= conv_ftl->cp.gc_thres_lines)
+		return;
+
+	/* Detach the line from whichever structure holds it. line->pos is the
+	 * codebase's authoritative "in victim_line_pq" flag (see mark_page_invalid):
+	 * nonzero => in the priority queue, zero => in full_line_list. Do NOT infer
+	 * from ipc: pqueue_remove() is unguarded and a pos==0 line corrupts the heap. */
+	if (line->pos) {
+		pqueue_remove(lm->victim_line_pq, line);
+		line->pos = 0; /* pqueue_remove() doesn't clear it; keep the invariant */
+		lm->victim_line_cnt--;
+	} else {
+		/* pos==0 must mean a genuine full line (the only non-curline, non-victim
+		 * line holding valid data). Defensive net: if it is not actually full
+		 * (e.g. a future multi-worker change exposed a popped-but-unfreed GC
+		 * victim, pos==0 && vpc<full), decline rather than list_del a dangling
+		 * node and underflow full_line_cnt. Nothing has been mutated yet here. */
+		if (line->vpc != spp->pgs_per_line)
+			return;
+		list_del_init(&line->entry);
+		lm->full_line_cnt--;
+	}
+
+	ppa.ppa = 0;
+	ppa.g.blk = line->id;
+
+	/* copy back valid data + erase every block in the line (mirrors do_gc) */
+	for (flashpg = 0; flashpg < spp->flashpgs_per_blk; flashpg++) {
+		int ch, lun;
+
+		ppa.g.pg = flashpg * spp->pgs_per_flashpg;
+		for (ch = 0; ch < spp->nchs; ch++) {
+			for (lun = 0; lun < spp->luns_per_ch; lun++) {
+				struct nand_lun *lunp;
+
+				ppa.g.ch = ch;
+				ppa.g.lun = lun;
+				ppa.g.pl = 0;
+				lunp = get_lun(conv_ftl->ssd, &ppa);
+				clean_one_flashpg(conv_ftl, &ppa);
+
+				if (flashpg == (spp->flashpgs_per_blk - 1)) {
+					struct convparams *cpp = &conv_ftl->cp;
+
+					mark_block_free(conv_ftl, &ppa);
+
+					if (cpp->enable_gc_delay) {
+						struct nand_cmd gce = {
+							.type = GC_IO,
+							.cmd = NAND_ERASE,
+							.stime = 0,
+							.interleave_pci_dma = false,
+							.ppa = &ppa,
+						};
+						ssd_advance_nand(conv_ftl->ssd, &gce);
+					}
+
+					lunp->gc_endtime = lunp->next_lun_avail_time;
+				}
+			}
+		}
+	}
+
+	mark_line_free(conv_ftl, &ppa);
+
+	conv_ftl->read_reclaim_cnt++;
+	NVMEV_INFO("read-reclaim: line=%d copied=%d erased_blks=%u RRT=%d total_reclaims=%lu\n",
+		   line->id, copied, (unsigned int)spp->blks_per_line, (int)READ_RECLAIM_THRESHOLD,
+		   (unsigned long)conv_ftl->read_reclaim_cnt);
+}
+
+/* Max distinct over-threshold lines queued for reclaim within one read command.
+ * A single command spans only a few lines, so this is never reached in practice. */
+#define RR_MAX_PER_CMD (64)
+
+/*
+ * Account one flash-page sense for read disturb: bump the physical block's
+ * read counter and, if it reached the reclaim threshold, queue its line for
+ * reclaim (deduplicated). Reclaim itself is deferred until after the command's
+ * senses are issued (see conv_read) so we never relocate a page mid-sense.
+ */
+static inline void rr_account_read(struct conv_ftl *conv_ftl, struct ppa *ppa,
+				   struct line **rc_lines, int *rc_n)
+{
+	struct nand_block *blk = get_blk(conv_ftl->ssd, ppa);
+	struct line *line;
+	int j;
+
+	/* Fire exactly once, when the counter first reaches the threshold. read_cnt
+	 * is bumped by 1 per sense so it always lands on the threshold value. Using
+	 * "==" (not ">=") means a block that could not be reclaimed (e.g. its line is
+	 * the active write pointer) is not re-queued on every subsequent read. */
+	if (++blk->read_cnt != READ_RECLAIM_THRESHOLD)
+		return;
+
+	line = get_line(conv_ftl, ppa);
+	for (j = 0; j < *rc_n; j++) {
+		if (rc_lines[j] == line)
+			return; /* already queued for this command */
+	}
+	if (*rc_n < RR_MAX_PER_CMD)
+		rc_lines[(*rc_n)++] = line;
+}
+
 static bool is_same_flash_page(struct conv_ftl *conv_ftl, struct ppa ppa1, struct ppa ppa2)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
@@ -849,6 +982,9 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 	uint32_t nr_parts = ns->nr_parts;
 
 	struct ppa prev_ppa;
+	/* lines whose blocks crossed the read-reclaim threshold during this command */
+	struct line *rc_lines[RR_MAX_PER_CMD];
+	int rc_n, rc_i;
 	struct nand_cmd srd = {
 		.type = USER_IO,
 		.cmd = NAND_READ,
@@ -873,6 +1009,7 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 	for (i = 0; (i < nr_parts) && (start_lpn <= end_lpn); i++, start_lpn++) {
 		conv_ftl = &conv_ftls[start_lpn % nr_parts];
 		xfer_size = 0;
+		rc_n = 0;
 		prev_ppa = get_maptbl_ent(conv_ftl, start_lpn / nr_parts);
 
 		/* normal IO read path */
@@ -902,6 +1039,7 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 				srd.ppa = &prev_ppa;
 				nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &srd);
 				nsecs_latest = max(nsecs_completed, nsecs_latest);
+				rr_account_read(conv_ftl, &prev_ppa, rc_lines, &rc_n);
 			}
 
 			xfer_size = spp->pgsz;
@@ -914,7 +1052,15 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 			srd.ppa = &prev_ppa;
 			nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &srd);
 			nsecs_latest = max(nsecs_completed, nsecs_latest);
+			rr_account_read(conv_ftl, &prev_ppa, rc_lines, &rc_n);
 		}
+
+		/* Deferred read-reclaim: now that all senses for this partition's
+		 * portion of the command are issued, reclaim any line whose block
+		 * crossed READ_RECLAIM_THRESHOLD. Done here (not mid-sense) so we
+		 * never relocate a page the read loop is still about to sense. */
+		for (rc_i = 0; rc_i < rc_n; rc_i++)
+			read_reclaim_line(conv_ftl, rc_lines[rc_i]);
 	}
 
 	ret->nsecs_target = nsecs_latest;

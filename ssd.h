@@ -95,6 +95,7 @@ struct nand_block {
 	int vpc; /* valid page count */
 	int erase_cnt;
 	int wp; /* current write pointer */
+	unsigned int read_cnt; /* reads since last erase (read-disturb / read-reclaim) */
 };
 
 struct nand_plane {

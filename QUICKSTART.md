@@ -5,14 +5,21 @@
 > the exact command. `experiment.md` is the staged implementation runbook; this file is the
 > turnkey "how to build, load, and run" reference for repeat experiments.
 
-Host: Linux `6.8.0-111-generic`, 125 GiB RAM, 24 cores. Repo: `/home/juchanlee/nvmevirt`.
-(Runbook was originally written for `6.5.0-35`; the host has since moved to `6.8.0-111` — see the
-build note below, which changed as a result.)
+Host: Linux `6.8.0-111-generic`, 125 GiB RAM, **32 cores** (nproc=32; `CPUS=22,23` are valid).
+Repo: `/home/juchanlee/nvmevirt`. (Runbook originally written for `6.5.0-35`; host moved to
+`6.8.0-111` — see the build note below.)
 
-> ⚠️ **Device-node safety (this host):** `/dev/nvme0n1` is the **real 1 TB Samsung SSD 960 PRO**.
-> NVMeVirt's emulated device appears as a *different* node after `insmod` (e.g. `/dev/nvme1n1`,
-> small ~3.6 GiB). **Always** identify the virtual node via `lsblk -d -o NAME,SIZE,MODEL` /
-> `dmesg` and point fio at THAT — never at `nvme0n1`, or you will overwrite the real disk.
+> ⚠️ **SHARED MACHINE + device-node safety (this host, verified 2026-05-31).** PIN OUR DEVICE BY
+> **IDENTITY, NOT BY NODE NUMBER** — the number depends on load order:
+> - `/dev/nvme0n1` = **REAL disk** (Crucial `CT2000P3SSD8`, **1.8 TB**) — never write to it.
+> - **Other user's** stock `nvmev` @ `memmap=16G$96G` = a **15 GiB** node — never `rmmod` it, never fio it.
+> - **OURS** = the renamed `nvmev_rr` @ `memmap=4G$64G` = the **3827 MiB (3.7 GiB)** node, with
+>   **`/proc/nvmev_rr` present** and `/sys/module/nvmev_rr/parameters/memmap_start=64G`.
+>
+> The kernel names ours `nvme2n1` only if the other user loaded first; if they are NOT loaded, ours
+> becomes **`nvme1n1`** (as observed 2026-05-31). The model string `CSL_Virt_MN_01` is shared by BOTH
+> modules — useless for telling them apart; **use SIZE (3.7 GiB) + `/proc/nvmev_rr`.** `rr_run.sh`
+> auto-pins by the 3827 MiB size. **Where this file and `experiment.md` disagree, `experiment.md` wins.**
 
 ---
 
@@ -24,15 +31,17 @@ build note below, which changed as a result.)
 | `fio` (+ `sysstat`) | workload generation / stat collection | `sudo apt install -y fio sysstat` |
 | Reserved memory + reboot | NVMeVirt maps its device into a reserved physical range | grub step below + reboot |
 | SSD build target | read reclaim lives in `conv_ftl.c` | `Kbuild`: `CONFIG_NVMEVIRT_SSD := y` (already set) |
-| (optional) sudo cache | avoid re-prompting during iteration | `echo "Defaults timestamp_timeout=120" \| sudo tee /etc/sudoers.d/nvmev-timeout && sudo chmod 0440 /etc/sudoers.d/nvmev-timeout && sudo visudo -c` |
+| sudo cache (across ttys) | agent shells use a different tty than your `sudo -v`; default `tty_tickets` makes each sudo re-prompt | `printf 'Defaults timestamp_timeout=120\nDefaults !tty_tickets\n' \| sudo tee /etc/sudoers.d/nvmev-timeout && sudo chmod 0440 /etc/sudoers.d/nvmev-timeout && sudo visudo -c` (then one `sudo -v` covers all ttys for 120 min) |
 
-**Reserve memory (grub):** edit `/etc/default/grub`, set inside the quotes of `GRUB_CMDLINE_LINUX`:
+**Reserve memory (grub):** this is a **shared host** — KEEP the other user's region and APPEND ours.
+Edit `/etc/default/grub` so `GRUB_CMDLINE_LINUX` contains **both** (mirror the existing `\$` escaping):
 ```
-memmap=4G\$64G isolcpus=22,23
+GRUB_CMDLINE_LINUX="memmap=16G\$96G memmap=4G\$64G"
 ```
-(= reserve 4 GiB at the 64 GiB offset; isolate cores 22,23 for NVMeVirt. Safe on 125 GiB RAM.)
-Then `sudo update-grub && sudo reboot`. After reboot confirm: `grep -o 'memmap=[^ ]*' /proc/cmdline`
-→ must show `memmap=4G$64G`.
+(= keep theirs 16 GiB@96 GiB; add ours 4 GiB@64 GiB. No `isolcpus` is set on this host — optional.)
+Then `sudo update-grub && sudo reboot` (warn the other user first; their device drops until they
+re-`insmod` — no grub change needed on their side). After reboot confirm BOTH:
+`grep -o 'memmap=[^ ]*' /proc/cmdline` → must show `memmap=16G$96G` **and** `memmap=4G$64G`.
 (If `insmod` panics in `__pci_enable_msix()`/`nvme_hwmon_init()`, add `intremap=off` to the same
 grub line and reboot — IOMMU incompatibility.)
 
@@ -44,20 +53,11 @@ grub line and reboot — IOMMU incompatibility.)
 - On the older **6.5.0-35** headers the symbol was absent and the build *required*
   `KCFLAGS=-DE820_TYPE_RESERVED_KERN=128`. To go back, run `KCFLAGS=-DE820_TYPE_RESERVED_KERN=128 ./reload.sh`.
 
-**Module signing (Secure Boot — required on this host):** Secure Boot is **enabled** and the kernel
-is locked down (`/sys/module/module/parameters/sig_enforce = Y`), so `insmod` rejects unsigned
-modules with `Key was rejected by service`. Fix = sign the module with an enrolled **MOK**:
-1. Key already generated at `/var/lib/shim-signed/mok/MOK.{key,der}` (RSA-2048, CN=NVMeVirt Local
-   Module Signing). Regenerate with `openssl req -new -x509 -newkey rsa:2048 -keyout MOK.key -out
-   MOK.der -outform DER -days 36500 -nodes -subj "/CN=NVMeVirt Local Module Signing/"`.
-2. **One-time enroll (needs reboot):** `sudo mokutil --import /var/lib/shim-signed/mok/MOK.der`
-   (set a one-time password) → `sudo reboot` → at the blue **MOK Manager** screen choose
-   *Enroll MOK → Continue → Yes*, re-enter the password. Verify after boot:
-   `mokutil --test-key /var/lib/shim-signed/mok/MOK.der` → "is already enrolled".
-3. `reload.sh` then auto-signs every rebuild via `scripts/sign-file` before `insmod` (override key
-   paths with `MOK_KEY`/`MOK_DER` env vars). Manual sign:
-   `sudo /usr/src/linux-headers-$(uname -r)/scripts/sign-file sha256 MOK.key MOK.der nvmev.ko`.
-Alternative (not preferred): disable Secure Boot in firmware — also a reboot, weakens system security.
+**Module signing — NOT required on this host (updated 2026-05-31).** Secure Boot is **DISABLED**
+(`mokutil --sb-state` = disabled, Setup Mode), kernel lockdown = none, `sig_enforce = N`. Plain
+`insmod` of the unsigned module **works** — no MOK signing needed. `reload.sh`'s signing block
+self-skips when no MOK key is present (harmless). *(The previous instructions here assumed Secure
+Boot was enabled with MOK signing — that was a **different server** and does not apply to this host.)*
 
 ---
 
@@ -68,9 +68,11 @@ cd /home/juchanlee/nvmevirt
 sudo -v                 # prime sudo cache (password in your terminal)
 ./reload.sh             # make (KCFLAGS) -> rmmod -> insmod (memmap_start=64G size=4G cpus=22,23) -> dmesg
 ```
-Healthy load: `dmesg` shows `NVMeVirt: Successfully created Virtual NVMe device`; a new
-`/dev/nvmeXn1` appears (verify: `lsblk -d -o NAME,SIZE,MODEL`); `/proc/nvmev/` exists.
-Unload: `sudo rmmod nvmev`. Build only (6.8): `make`.
+Healthy load: `dmesg` shows `NVMeVirt: Virtual NVMe device created`; a new `/dev/nvmeXn1` appears
+(verify it's the **3.7 GiB** node: `lsblk -d -o NAME,SIZE,MODEL`); `/proc/nvmev_rr/` exists.
+Unload **ours only**: `sudo rmmod nvmev_rr` (NEVER `rmmod nvmev` — other user's). Build only (6.8): `make`.
+(`reload.sh` detects an already-loaded module via `lsmod | grep -qw nvmev_rr` and rmmods it first;
+if `insmod` ever reports `File exists`, the old module is still resident — `sudo rmmod nvmev_rr`.)
 
 ---
 
@@ -79,17 +81,26 @@ Unload: `sudo rmmod nvmev`. Build only (6.8): `make`.
 > Reads only accumulate on blocks that hold **valid data**, so a write pass must precede the read
 > loop. Re-reading a small region in a loop drives per-block read counts up fast.
 
+**Easiest (one command, auto-pins our device by size, clears dmesg, reports reclaims + BW):**
 ```bash
-DEV=/dev/nvme1n1        # ⚠️ the NVMeVirt virtual node — VERIFY with lsblk; NOT nvme0n1 (real disk)
 cd /home/juchanlee/nvmevirt
-./reload.sh
-sudo python3 nvmev-evaluation/common/set_perf.py max          # remove artificial latency
+sudo -v                                  # prime sudo (once; lasts 120 min via the drop-in)
+./rr_run.sh reclaim 180                   # reload (current RRT) + prep-write + 180s seq-read + report
+# A/B control: set READ_RECLAIM_THRESHOLD to 1000000000 in ssd_config.h, then:
+./rr_run.sh disabled 180                  # 0 reclaims, flat BW = baseline; revert RRT to 8 after
+# results in rr_results/{fio_<label>.log, bw_<label>.log}
+```
+**Manual equivalent** (note `set_perf_rr.py`, NOT `set_perf.py` — the latter writes `/proc/nvmev`,
+ours is `/proc/nvmev_rr`):
+```bash
+DEV=/dev/nvme1n1        # ⚠️ VERIFY = our 3.7 GiB node (lsblk). NOT nvme0n1 (1.8T real), NOT the 15G other-user node
+cd /home/juchanlee/nvmevirt && ./reload.sh
+sudo python3 nvmev-evaluation/common/set_perf_rr.py max       # remove artificial latency (targets /proc/nvmev_rr)
 cd nvmev-evaluation/fio
 sudo DEV=$DEV RR_SIZE=2g fio workloads/rr-prep-write.fio              # STEP 1: populate valid pages
 sudo DEV=$DEV RR_SIZE=2g RR_RUNTIME=180 fio workloads/rr-seq-read.fio # STEP 2: looping seq-read
-# inspect:
-cat rr-read_bw.1.log     # per-second bandwidth -> look for reclaim-induced dips
-dmesg | grep -i reclaim  # reclaim events (needs the printk added in Stage B)
+cat rr-read_bw.1.log              # per-second bandwidth -> reclaim-induced dips
+sudo dmesg | grep 'read-reclaim:' # reclaim events (printk added in Stage B)
 ```
 Notify when done: `/home/juchanlee/nvmevirt/notify.sh "run done — <summary>"`.
 
@@ -99,17 +110,18 @@ Notify when done: `/home/juchanlee/nvmevirt/notify.sh "run done — <summary>"`.
 
 | Setting | Value | Notes |
 |---------|-------|-------|
-| `memmap` | `4G$64G` | small device = fast reclaim |
-| `CPUS` / `isolcpus` | `22,23` | NVMeVirt dispatcher + worker |
-| Device node | `/dev/nvme1n1` (VERIFY; **nvme0n1 = real disk**) | NVMeVirt virtual node for fio |
-| `RR_SIZE` | `2g` | keep < logical capacity (OP-reduced) |
-| `READ_RECLAIM_THRESHOLD` | _TBD_ | start ~1K–10K for fast verification |
-| Baseline seq-read BW | _TBD_ | reference for reclaim comparison |
-| Reclaim seq-read BW | _TBD_ | should dip below baseline |
+| `memmap` (ours) | `4G$64G` | 2nd region we add; small device = fast reclaim. Theirs = `16G$96G` (leave it) |
+| Module name (ours) | `nvmev_rr` | renamed from `nvmev` to coexist with other user (experiment.md §1e) |
+| `CPUS` / `isolcpus` | `22,23` (nproc=32, so valid) | NVMeVirt dispatcher + worker; no isolcpus set on this host |
+| Device node (ours) | the **3.7 GiB** node (`nvme1n1` when other user not loaded; VERIFY by size + `/proc/nvmev_rr`) | our nvmev_rr node for fio |
+| `RR_SIZE` | `2g` | keep < logical capacity (OP-reduced). Device logical ≈ 3827 MiB |
+| `READ_RECLAIM_THRESHOLD` | **8** (verification); `1000000000` = disabled (A/B control) | reads/block. NOTE geometry: a block here is **1 flash page**, so a seq pass adds only **+1** per block ⇒ the doc's 1K–10K would need ~30 min to fire; 8 fires within ~8 s. Production HW = 1e4–1e6. In `ssd_config.h` (`#ifndef`-guarded). |
+| Baseline seq-read BW | **~1003–1006 MiB/s** (reclaim disabled; flat, min 983) | reference (Stage A and RRT-disabled control agree) |
+| Reclaim seq-read BW | **avg 954 MiB/s, dips to ~652 MiB/s** (RRT=8) | ~36% periodic dips during reclaim bursts; 45057+ reclaim events/instance in 180 s; 0 fio errors |
 
 ---
 
 ## 5. Cleanup / troubleshooting
 - Stop leftover fio/stat collectors: `nvmev-evaluation/common/abort_eval.sh`
-- Reset the device state: `sudo rmmod nvmev && ./reload.sh`
+- Reset the device state (ours only): `sudo rmmod nvmev_rr && ./reload.sh`  (NEVER `rmmod nvmev` — other user's)
 - Upstream reference: `nvmev-evaluation/FIO_NVMEVIRT_QUICKSTART.md`

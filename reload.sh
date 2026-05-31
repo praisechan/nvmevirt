@@ -21,7 +21,7 @@ set -euo pipefail
 MEMMAP_START="${MEMMAP_START:-64G}"    # offset of reserved memory  (memmap=4G$64G -> 64G)
 MEMMAP_SIZE="${MEMMAP_SIZE:-4G}"       # size of reserved memory    (memmap=4G$64G -> 4G)
 CPUS="${CPUS:-22,23}"                  # >=2 cores: 1 dispatcher + >=1 worker
-MODNAME=nvmev
+MODNAME=nvmev_rr
 
 # Kernel 6.8.0-111 (current host) DEFINES E820_TYPE_RESERVED_KERN in its headers
 # (arch/x86/include/asm/e820/types.h), so we must NOT force-define it — doing so
@@ -37,9 +37,9 @@ cd "$DIR"
 echo "==> [1/4] Building module (make KCFLAGS=$KCFLAGS)..."
 make KCFLAGS="$KCFLAGS"
 
-# Secure Boot is enabled on this host (sig_enforce=Y under EFI lockdown), so the
-# kernel rejects unsigned modules ("Key was rejected by service"). Sign the freshly
-# built module with the enrolled MOK before loading. One-time enroll: see QUICKSTART §1.
+# Secure Boot is DISABLED on this host (mokutil --sb-state=disabled, sig_enforce=N,
+# lockdown=none), so plain insmod of the unsigned module works — no signing needed.
+# The MOK-signing block below self-skips when no MOK key is present (harmless here).
 MOK_KEY="${MOK_KEY:-/var/lib/shim-signed/mok/MOK.key}"
 MOK_DER="${MOK_DER:-/var/lib/shim-signed/mok/MOK.der}"
 SIGN_FILE="/usr/src/linux-headers-$(uname -r)/scripts/sign-file"
@@ -52,7 +52,7 @@ else
 fi
 
 echo "==> [2/4] Unloading old module if present..."
-if lsmod | grep -q "^${MODNAME}\b"; then
+if lsmod | grep -qw "${MODNAME}"; then
     sudo rmmod "$MODNAME"
 else
     echo "    (not loaded)"

@@ -242,6 +242,22 @@ static_assert((ZONE_SIZE % DIES_PER_ZONE) == 0);
 #endif
 ///////////////////////////////////////////////////////////////////////////
 
+/*
+ * Read reclaim (read-disturb mitigation): reclaim a physical NAND block once it
+ * has been read READ_RECLAIM_THRESHOLD times since its last erase. Counted per
+ * physical block (struct nand_block.read_cnt); see conv_ftl.c read_reclaim_line().
+ *
+ * Production hardware tolerates ~1e4-1e6 reads/block. This is a deliberately LOW
+ * value for verification: in this emulated geometry a NAND block is exactly one
+ * flash page, so a sequential read pass adds only +1 to each block's read_cnt.
+ * A small threshold therefore makes reclaim fire within seconds and recur, which
+ * is what we measure (read-bandwidth dips from reclaim contention). Set very high
+ * (e.g. 1000000000) to effectively disable reclaim for the A/B baseline run.
+ */
+#ifndef READ_RECLAIM_THRESHOLD
+#define READ_RECLAIM_THRESHOLD (8)
+#endif
+
 static const uint32_t ns_ssd_type[] = { NS_SSD_TYPE_0, NS_SSD_TYPE_1 };
 static const uint64_t ns_capacity[] = { NS_CAPACITY_0, NS_CAPACITY_1 };
 
