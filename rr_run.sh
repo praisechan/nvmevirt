@@ -59,13 +59,17 @@ sudo dmesg -C
 sudo python3 nvmev-evaluation/common/set_perf_rr.py max >/dev/null 2>&1 || true
 
 RR_SIZE="${RR_SIZE:-512m}"
+# Per-interval BW-log resolution (ms). Default 1 s (matches the 0601 sweep);
+# set LOG_AVG_MSEC=250 for finer curves. Always exported so rr-seq-read.fio's
+# log_avg_msec=${LOG_AVG_MSEC} substitution never fails.
+LOG_AVG_MSEC="${LOG_AVG_MSEC:-1000}"
 cd nvmev-evaluation/fio
 echo "==> [$LABEL] STEP 1 prep-write $RR_SIZE"
 sudo DEV=$DEV RR_SIZE=$RR_SIZE fio workloads/rr-prep-write.fio >/tmp/rr_prep_$LABEL.log 2>&1
 grep -E 'WRITE:' /tmp/rr_prep_$LABEL.log || true
 
-echo "==> [$LABEL] STEP 2 seq-read loop ${RUNTIME}s (RR_SIZE=$RR_SIZE)"
-sudo DEV=$DEV RR_SIZE=$RR_SIZE RR_RUNTIME=$RUNTIME fio workloads/rr-seq-read.fio >"../../$OUTDIR/fio_$LABEL.log" 2>&1
+echo "==> [$LABEL] STEP 2 seq-read loop ${RUNTIME}s (RR_SIZE=$RR_SIZE, LOG_AVG_MSEC=$LOG_AVG_MSEC)"
+sudo DEV=$DEV RR_SIZE=$RR_SIZE RR_RUNTIME=$RUNTIME LOG_AVG_MSEC=$LOG_AVG_MSEC fio workloads/rr-seq-read.fio >"../../$OUTDIR/fio_$LABEL.log" 2>&1
 grep -E 'READ:|IOPS' "../../$OUTDIR/fio_$LABEL.log" | head
 cp -f rr-read_bw.1.log "../../$OUTDIR/bw_$LABEL.log" 2>/dev/null || true
 cd ../..

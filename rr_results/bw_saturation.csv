@@ -1,0 +1,8 @@
+mode,iodepth,numjobs,bw_MiBps,bw_MBps,iops
+iodepth,1,1,952,998,7612
+iodepth,4,1,2928,3070,23.4k
+iodepth,16,1,3357,3520,26.9k
+iodepth,32,1,3357,3520,26.9k
+iodepth,64,1,3357,3520,26.9k
+numjobs,32,2,3357,3520,26.9k
+numjobs,32,4,3357,3520,26.9k

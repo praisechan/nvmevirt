@@ -1,0 +1,32 @@
+# Bandwidth saturation probe (0602 §1B) — SEPARATE from the reclaim test.
+# Goal: find the concurrency that saturates the emulated 970 PRO's read path
+# (~3360 MB/s model ceiling = min(NAND 8x800, PCIe 3360)), and show that the
+# ~1 GB/s seen in the reclaim test is purely the deliberate QD1/psync choice.
+#
+# Unlike rr-seq-read.fio (psync, QD1), this uses libaio so iodepth/numjobs can
+# put many 128 KiB I/Os in flight over a large prepped region spanning all 4 FTL
+# instances. Reclaim must be OFF and the region prep-written first (conv_ftl
+# skips reads of unwritten LPNs => bogus BW).
+#
+# All knobs env-driven; bw_saturation.sh sweeps them:
+#   sudo DEV=/dev/nvmeXn1 BW_SIZE=8g BW_RUNTIME=30 IODEPTH=32 NUMJOBS=1 \
+#        OFFSET_INCREMENT=0 fio seq-read-bw.fio
+# For numjobs>1 the driver tiles the 8 GiB region: BW_SIZE=8g/NUMJOBS and
+# OFFSET_INCREMENT=BW_SIZE so jobs read disjoint slices (total span stays 8 GiB).
+[global]
+filename=${DEV}
+buffered=0
+ioengine=libaio
+direct=1
+bs=128k
+rw=read
+time_based=1
+runtime=${BW_RUNTIME}
+group_reporting=1
+iodepth=${IODEPTH}
+numjobs=${NUMJOBS}
+offset_increment=${OFFSET_INCREMENT}
+
+[seq-read-bw]
+offset=0
+size=${BW_SIZE}

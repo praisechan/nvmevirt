@@ -43,6 +43,59 @@ Recommended: always produce the **SVG (Path B)**; additionally produce a **PNG (
 
 ---
 
+## 1B. (NEW) Bandwidth sanity check — why is peak read BW ~1 GB/s, not ~3.5 GB/s?
+The emulated base device is a **Samsung 970 PRO**, datasheet sequential read **~3500 MB/s**. But every
+read-reclaim run (0531, 0601) measured only **~1000–1010 MB/s** (≈964 MiB/s). Before/alongside the
+time-series plots, run a short sanity check to (a) **explain the gap** and (b) **find settings that
+reach near-peak**, then report it. The ~1 GB/s number is almost certainly a *workload* artifact, not a
+defect — confirm with evidence.
+
+**Root-cause hypotheses (investigate; the first is near-certain — see the files):**
+1. **Queue depth = 1, single thread (PRIMARY).** `nvmev-evaluation/fio/workloads/rr-seq-read.fio` uses
+   `ioengine=psync` with **no `iodepth` and no `numjobs`** ⇒ exactly **one synchronous 128 KiB I/O in
+   flight**. At QD1 the stream is *latency-bound*: BW ≈ bs / per-I/O round-trip ≈ 1 GB/s no matter how
+   many channels/instances exist. This is **correct and desired for the reclaim test** (so reclaim
+   contention shows up in the per-second BW) — but it is NOT the device's peak. **Do not change the
+   reclaim workload;** the sanity check is a *separate* job.
+2. **Under-used internal parallelism.** This config has `SSD_PARTITIONS=4` FTL instances × 2 channels
+   each (8 channels total); a real 1 TB 970 PRO has many more dies/channels. Saturating the 4 instances
+   + 8 channels needs **many outstanding I/Os** (high QD and/or multiple jobs) over a region that spans
+   all instances. A QD1 stream touches essentially one instance/channel at a time.
+3. **Model bandwidth ceiling (so "3500" ≈ "3360" here).** In `ssd_config.h` the 970 PRO model sets
+   `NAND_CHANNEL_BANDWIDTH=800` MB/s (×8 ch = 6400 aggregate) and **`PCIE_BANDWIDTH=3360` MB/s**. The
+   achievable read ceiling in this emulator is **min(NAND, PCIe) ≈ 3360 MB/s**. So **target ≈ 3.3–3.4
+   GB/s**, not exactly 3500. (Reaching the datasheet 3500 would mean editing `PCIE_BANDWIDTH` — note it,
+   but the realistic goal is ~3.36 GB/s.)
+4. **Latency is already maxed out (not the cap).** `set_perf_rr.py max` drives the artificial latency
+   model to ~1 ns (`delay_initial=[1,1]`, `per_op_latency=[1,1]`, `io_unit_shift=15`) on
+   `/proc/nvmev_rr` — so latency is NOT the limiter; **concurrency is.** Confirm it's applied to
+   `nvmev_rr` (the stock `set_perf.py` writes `/proc/nvmev` and silently no-ops for our module).
+5. **Secondary constraints.** `MDTS=6` caps a single I/O around 256 KiB ⇒ keep **`bs ≤ 256k`**. conv_ftl
+   **skips reads of unwritten LPNs** (no NAND sense ⇒ bogus inflated BW) ⇒ **prep-write the whole
+   measured region first**.
+
+**Method — a separate high-throughput job, reclaim OFF so it doesn't interfere:**
+- `READ_RECLAIM_THRESHOLD=1000000000` (reclaim disabled), reload, pin device by **load-order**,
+  `sudo python3 nvmev-evaluation/common/set_perf_rr.py max`.
+- **Prep-write a large region** (e.g. **8 GiB**, well within the ~15 GiB device, so the stream spans all
+  4 FTL instances). Reading must hit written LPNs (hypothesis 5).
+- Add a new fio job `nvmev-evaluation/fio/workloads/seq-read-bw.fio`: `ioengine=libaio`, `direct=1`,
+  `bs=128k`, `rw=read`, region = the 8 GiB prepped, `time_based`, `runtime≈30`, `group_reporting`.
+  **Sweep concurrency** (this is the experiment):
+  - `iodepth` ∈ {1, 4, 16, 32, 64} at `numjobs=1`, then
+  - `numjobs` ∈ {1, 2, 4} at `iodepth=32` (use `offset_increment=2g` so jobs read different regions).
+- Record aggregate read BW (MB/s) per point → a small table, plus a quick BW-vs-iodepth line/bar plot
+  (reuse the §1 plotting toolchain; dependency-free SVG is fine).
+
+**Goal / "set the right setting":** identify where BW saturates and **report the settings that reach
+near the ~3.36 GB/s ceiling** (expected: `libaio` + `iodepth ≥ 32`, and/or `numjobs ≥ 4`). State plainly
+the achieved peak vs the **3500 MB/s** datasheet spec and the **3360 MB/s** model ceiling, and confirm
+that the ~1 GB/s reclaim-test figure is purely the deliberate **QD1/psync** choice — not a bug. If even
+high QD can't pass ~3.36 GB/s, that's the `PCIE_BANDWIDTH` cap (hypothesis 3); note whether bumping it
+is desired (likely out of scope — leave the model as-is unless the user asks).
+
+---
+
 ## 2. Data — reuse or re-run
 The bw logs from the 0601 sweep already exist and are sufficient for a first figure:
 ```
@@ -86,9 +139,10 @@ Output: save to `reports/figures/` (create it) as **`rrt_bw_timeseries_overlay.s
 ---
 
 ## 5. Deliverable
-- The two figures (SVG always; PNG if matplotlib installed) under `reports/figures/`.
+- The two RRT time-series figures (SVG always; PNG if matplotlib installed) under `reports/figures/`.
 - The generator script (`plot_rrt_bw.py`) committed alongside.
-- A short markdown note **`reports/0602_report_bw-timeseries-viz.md`**: what was plotted, data source (reused 0601 logs vs fresh fine-grained run + the log_avg_msec used), how to regenerate (`python3 plot_rrt_bw.py`), and 2–3 sentences reading the figures (dip frequency vs RRT, common dip floor, baseline flatness). Embed/reference the figures. Keep it short — the analysis already lives in 0601.
+- **Bandwidth sanity check (§1B):** the new `seq-read-bw.fio`, a concurrency-sweep table (iodepth/numjobs → MB/s) + a small BW-vs-concurrency plot, and the conclusion (peak achieved, the settings that reach it, vs the 3500 spec / 3360 model ceiling, and confirmation the ~1 GB/s reclaim number is the QD1 choice).
+- A short markdown note **`reports/0602_report_bw-timeseries-viz.md`** with **two parts**: (1) the RRT time-series viz — what was plotted, data source (reused 0601 logs vs fresh fine-grained run + the `log_avg_msec` used), how to regenerate (`python3 plot_rrt_bw.py`), and 2–3 sentences reading the figures (dip frequency vs RRT, common dip floor, baseline flatness); (2) the bandwidth sanity check — root cause of the ~1 GB/s reclaim-test number and the near-peak settings. Embed/reference the figures. Keep it short — the reclaim analysis already lives in 0601.
 
 ---
 
@@ -96,8 +150,10 @@ Output: save to `reports/figures/` (create it) as **`rrt_bw_timeseries_overlay.s
 1. Preflight: read §0 docs; confirm coexistence state (`/proc/cmdline` has both regions, `lsblk`, `lsmod`, `/proc/nvmev_rr`, sudo). No reboot needed.
 2. Decide data source: **fast** (plot existing `rr_results/bw_*_16g.log`) or **better** (re-run sweep with `log_avg_msec`≈250). If re-running, reuse `rr_run.sh`/`rr_sweep.sh` (load-order device pin), verify each point fires.
 3. Resolve the plotting toolchain (§1): always build the **zero-dep SVG**; **Slack the user** before any `apt install` for the optional PNG.
-4. Generate both figures (§4), **verify they render and match the numbers**, write `reports/0602_report_bw-timeseries-viz.md`.
-5. Restore `READ_RECLAIM_THRESHOLD=8`, leave module in a known state. Final Slack summary.
-6. Commit only if the user asks; if so, branch off (current branch: `read-reclaim-16g-rrt-sweep`) — do not push without asking.
+4. Generate both RRT time-series figures (§4), **verify they render and match the numbers**.
+5. **Bandwidth sanity check (§1B):** with reclaim OFF, prep-write ~8 GiB, run the `seq-read-bw.fio` concurrency sweep (iodepth then numjobs), find the near-peak setting, confirm the QD1 root cause. (Can run in parallel with the plotting once the sweep logs exist.)
+6. Write `reports/0602_report_bw-timeseries-viz.md` (both parts, §5).
+7. Restore `READ_RECLAIM_THRESHOLD=8`, leave module in a known state. Final Slack summary.
+8. Commit only if the user asks; if so, commit to `read-reclaim` (current branch) — do not push without asking.
 
 > Safety reminders, condensed: never `nvme0n1` (real) or the other user's `nvmev`; pin our node by **load-order** + `/proc/nvmev_rr` + `memmap_start=64G` (NEVER by size — both devices are ~15 GiB); no reboot/grub change this experiment; `sudo -v` per batch (Slack the user); no `KCFLAGS` on kernel 6.8; matplotlib/pip are NOT installed — default to the dependency-free SVG generator.

@@ -22,4 +22,7 @@ bs=128k
 offset=0
 size=${RR_SIZE}
 write_bw_log=rr-read
-log_avg_msec=1000
+# Per-interval BW log resolution. Env-overridable (default 1000 ms == 1 s).
+# rr_run.sh always exports LOG_AVG_MSEC (default 1000); set e.g. LOG_AVG_MSEC=250
+# for finer-grained curves so reclaim bursts are smooth, not aliased.
+log_avg_msec=${LOG_AVG_MSEC}
