@@ -9,17 +9,20 @@ Host: Linux `6.8.0-111-generic`, 125 GiB RAM, **32 cores** (nproc=32; `CPUS=22,2
 Repo: `/home/juchanlee/nvmevirt`. (Runbook originally written for `6.5.0-35`; host moved to
 `6.8.0-111` — see the build note below.)
 
-> ⚠️ **SHARED MACHINE + device-node safety (this host, verified 2026-05-31).** PIN OUR DEVICE BY
-> **IDENTITY, NOT BY NODE NUMBER** — the number depends on load order:
+> ⚠️ **SHARED MACHINE + device-node safety.** PIN OUR DEVICE BY **IDENTITY, NOT BY NODE NUMBER** —
+> the number depends on load order:
 > - `/dev/nvme0n1` = **REAL disk** (Crucial `CT2000P3SSD8`, **1.8 TB**) — never write to it.
-> - **Other user's** stock `nvmev` @ `memmap=16G$96G` = a **15 GiB** node — never `rmmod` it, never fio it.
-> - **OURS** = the renamed `nvmev_rr` @ `memmap=4G$64G` = the **3827 MiB (3.7 GiB)** node, with
->   **`/proc/nvmev_rr` present** and `/sys/module/nvmev_rr/parameters/memmap_start=64G`.
+> - **Other user's** stock `nvmev` @ `memmap=16G$96G` = a **~15 GiB** node — never `rmmod` it, never fio it.
+> - **OURS** = the renamed `nvmev_rr`, **`/proc/nvmev_rr` present**,
+>   `/sys/module/nvmev_rr/parameters/memmap_start=68719476736` (64G).
 >
-> The kernel names ours `nvme2n1` only if the other user loaded first; if they are NOT loaded, ours
-> becomes **`nvme1n1`** (as observed 2026-05-31). The model string `CSL_Virt_MN_01` is shared by BOTH
-> modules — useless for telling them apart; **use SIZE (3.7 GiB) + `/proc/nvmev_rr`.** `rr_run.sh`
-> auto-pins by the 3827 MiB size. **Where this file and `experiment.md` disagree, `experiment.md` wins.**
+> **⚠️ DO NOT pin by SIZE any more (updated 2026-06-01).** Our region was enlarged from `4G$64G` to
+> **`16G$64G`**, so our device is now a **~15 GiB** node (`ns size 15311 MiB`) — the **same size as the
+> other user's**, and the model string `CSL_Virt_MN_01` is shared by both. Size+model can no longer
+> tell them apart. **Pin by LOAD-ORDER:** snapshot `/dev/nvme*n1` after `rmmod nvmev_rr` and before
+> `insmod`; the **newly-appeared** node is ours, cross-checked by `/proc/nvmev_rr` +
+> `memmap_start=64G`. `rr_run.sh` now does exactly this (the old 3827 MiB size-pin was removed).
+> **Where this file and `experiment.md` disagree, `experiment.md` wins.**
 
 ---
 
@@ -108,16 +111,22 @@ Notify when done: `/home/juchanlee/nvmevirt/notify.sh "run done — <summary>"`.
 
 ## 4. Known-good settings (fill in / update as you converge)
 
+> **Current device = 16 GiB (updated 2026-06-01).** Region enlarged to `memmap=16G$64G`; see
+> `reports/0601_report_rrt-sweep-16g.md` for the geometry + RRT sweep. The 4 GiB values below are the
+> earlier (2026-05-31) state, kept for contrast.
+
 | Setting | Value | Notes |
 |---------|-------|-------|
-| `memmap` (ours) | `4G$64G` | 2nd region we add; small device = fast reclaim. Theirs = `16G$96G` (leave it) |
+| `memmap` (ours) | **`16G$64G`** (was `4G$64G`) | enlarged for realistic block geometry. Theirs = `16G$96G` (leave it) |
 | Module name (ours) | `nvmev_rr` | renamed from `nvmev` to coexist with other user (experiment.md §1e) |
 | `CPUS` / `isolcpus` | `22,23` (nproc=32, so valid) | NVMeVirt dispatcher + worker; no isolcpus set on this host |
-| Device node (ours) | the **3.7 GiB** node (`nvme1n1` when other user not loaded; VERIFY by size + `/proc/nvmev_rr`) | our nvmev_rr node for fio |
-| `RR_SIZE` | `2g` | keep < logical capacity (OP-reduced). Device logical ≈ 3827 MiB |
-| `READ_RECLAIM_THRESHOLD` | **8** (verification); `1000000000` = disabled (A/B control) | reads/block. NOTE geometry: a block here is **1 flash page**, so a seq pass adds only **+1** per block ⇒ the doc's 1K–10K would need ~30 min to fire; 8 fires within ~8 s. Production HW = 1e4–1e6. In `ssd_config.h` (`#ifndef`-guarded). |
-| Baseline seq-read BW | **~1003–1006 MiB/s** (reclaim disabled; flat, min 983) | reference (Stage A and RRT-disabled control agree) |
-| Reclaim seq-read BW | **avg 954 MiB/s, dips to ~652 MiB/s** (RRT=8) | ~36% periodic dips during reclaim bursts; 45057+ reclaim events/instance in 180 s; 0 fio errors |
+| Device node (ours) | **`/dev/nvme1n1`** (~15 GiB at 16G); **VERIFY by LOAD-ORDER + `/proc/nvmev_rr` + `memmap_start=64G`, NOT by size** | size now collides with other user's ~15 GiB node |
+| `RR_SIZE` | `512m` (16G sweep); was `2g` on 4G device | smaller region = faster passes so higher RRT fires within 180 s |
+| `READ_RECLAIM_THRESHOLD` | **8** (default, restored); `1000000000` = disabled (A/B control) | reads/block, **geometry-dependent**: 16G block = 4 flash pages ⇒ +4/pass (4G block = 1 page ⇒ +1/pass). In `ssd_config.h` (`#ifndef`-guarded). |
+| Geometry (16G, per FTL instance) | blk **128 KiB** (pgs_per_blk **32**, flashpgs_per_blk **4**); line **512 KiB** (pgs_per_line **128**, blks_per_line **4**); 8192 lines | vs 4G: 32 KiB blk (8 / 1) |
+| Baseline seq-read BW (16G) | **flat ~964 MiB/s** (RRT disabled; min 940, max 968) | reference for the sweep |
+| Reclaim seq-read BW (16G) | RRT 16/64/256/1024 → avg **838.6 / 930.2 / 956.8 / 963.8 MiB/s**; dip floor ~650–740 MiB/s | reclaims/instance 19712 / 5120 / 1280 / 256; 0 fio errors. RRT=64 = good default (−3.5%) |
+| Reclaim seq-read BW (4G, 2026-05-31) | **avg 954 MiB/s, dips to ~652** (RRT=8); baseline ~1003–1006 | ~36% dips; 45057+ reclaims/instance/180 s |
 
 ---
 

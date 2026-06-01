@@ -171,3 +171,6 @@ sphinx_*/
 
 # Local makefile
 Makefile.local
+
+# transient fio per-second bandwidth working logs (copied into rr_results/)
+nvmev-evaluation/fio/rr-read_bw.*.log

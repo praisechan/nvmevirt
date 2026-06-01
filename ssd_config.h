@@ -248,11 +248,16 @@ static_assert((ZONE_SIZE % DIES_PER_ZONE) == 0);
  * physical block (struct nand_block.read_cnt); see conv_ftl.c read_reclaim_line().
  *
  * Production hardware tolerates ~1e4-1e6 reads/block. This is a deliberately LOW
- * value for verification: in this emulated geometry a NAND block is exactly one
- * flash page, so a sequential read pass adds only +1 to each block's read_cnt.
- * A small threshold therefore makes reclaim fire within seconds and recur, which
- * is what we measure (read-bandwidth dips from reclaim contention). Set very high
- * (e.g. 1000000000) to effectively disable reclaim for the A/B baseline run.
+ * value for verification. NOTE: RRT is reads-per-physical-block and is therefore
+ * GEOMETRY-DEPENDENT -- it counts NAND senses, and a sequential pass over a block
+ * adds +flashpgs_per_blk to read_cnt (flashpgs_per_blk = blk_size / FLASH_PAGE_SIZE,
+ * which scales with the memmap region size). On the 4 GiB device a block is 1 flash
+ * page (+1/pass); on the 16 GiB device it is 4 flash pages (+4/pass). To reproduce a
+ * given reclaim cadence on a different device size, scale RRT by flashpgs_per_blk.
+ * A small threshold makes reclaim fire within seconds and recur (read-bandwidth dips
+ * from reclaim contention). Set very high (e.g. 1000000000) to disable reclaim for
+ * the A/B baseline. See reports/0601_report_rrt-sweep-16g.md for a measured RRT sweep
+ * (16/64/256/1024) on the 16 GiB geometry; reports/0531 for the 4 GiB device.
  */
 #ifndef READ_RECLAIM_THRESHOLD
 #define READ_RECLAIM_THRESHOLD (8)
