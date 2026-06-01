@@ -1,0 +1,27 @@
+# Read-reclaim time-series — high-queue-depth variant of rr-seq-read.fio.
+# Same looping sequential read over a small region (so read_cnt climbs and
+# crosses RRT), but with libaio + a tunable iodepth so the read path runs at
+# max bandwidth (~3357 MiB/s at iodepth>=16) instead of the QD1/psync ~954.
+# Lets us see reclaim dips against the MAXIMUM-bandwidth baseline.
+#
+#   sudo DEV=/dev/nvmeXn1 RR_SIZE=512m RR_RUNTIME=180 IODEPTH=16 \
+#        LOG_AVG_MSEC=250 fio rr-seq-read-iodepth.fio
+#
+# NOTE: this is NOT the canonical reclaim test (that one is QD1/psync on
+# purpose). This variant exists for the max-bandwidth time-series figures.
+[global]
+filename=${DEV}
+buffered=0
+ioengine=libaio
+direct=1
+time_based=1
+runtime=${RR_RUNTIME}
+iodepth=${IODEPTH}
+
+[seq-read-loop]
+rw=read
+bs=128k
+offset=0
+size=${RR_SIZE}
+write_bw_log=rr-read
+log_avg_msec=${LOG_AVG_MSEC}

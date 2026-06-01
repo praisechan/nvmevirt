@@ -60,16 +60,21 @@ sudo python3 nvmev-evaluation/common/set_perf_rr.py max >/dev/null 2>&1 || true
 
 RR_SIZE="${RR_SIZE:-512m}"
 # Per-interval BW-log resolution (ms). Default 1 s (matches the 0601 sweep);
-# set LOG_AVG_MSEC=250 for finer curves. Always exported so rr-seq-read.fio's
+# set LOG_AVG_MSEC=250 for finer curves. Always exported so the fio job's
 # log_avg_msec=${LOG_AVG_MSEC} substitution never fails.
 LOG_AVG_MSEC="${LOG_AVG_MSEC:-1000}"
+# Read workload + queue depth. Default = canonical QD1/psync reclaim test.
+# Set RR_FIO=workloads/rr-seq-read-iodepth.fio + IODEPTH=16 for the max-bandwidth
+# variant. IODEPTH is exported unconditionally (psync ignores it).
+RR_FIO="${RR_FIO:-workloads/rr-seq-read.fio}"
+IODEPTH="${IODEPTH:-1}"
 cd nvmev-evaluation/fio
 echo "==> [$LABEL] STEP 1 prep-write $RR_SIZE"
 sudo DEV=$DEV RR_SIZE=$RR_SIZE fio workloads/rr-prep-write.fio >/tmp/rr_prep_$LABEL.log 2>&1
 grep -E 'WRITE:' /tmp/rr_prep_$LABEL.log || true
 
-echo "==> [$LABEL] STEP 2 seq-read loop ${RUNTIME}s (RR_SIZE=$RR_SIZE, LOG_AVG_MSEC=$LOG_AVG_MSEC)"
-sudo DEV=$DEV RR_SIZE=$RR_SIZE RR_RUNTIME=$RUNTIME LOG_AVG_MSEC=$LOG_AVG_MSEC fio workloads/rr-seq-read.fio >"../../$OUTDIR/fio_$LABEL.log" 2>&1
+echo "==> [$LABEL] STEP 2 seq-read loop ${RUNTIME}s (RR_SIZE=$RR_SIZE, LOG_AVG_MSEC=$LOG_AVG_MSEC, RR_FIO=$RR_FIO, IODEPTH=$IODEPTH)"
+sudo DEV=$DEV RR_SIZE=$RR_SIZE RR_RUNTIME=$RUNTIME LOG_AVG_MSEC=$LOG_AVG_MSEC IODEPTH=$IODEPTH fio "$RR_FIO" >"../../$OUTDIR/fio_$LABEL.log" 2>&1
 grep -E 'READ:|IOPS' "../../$OUTDIR/fio_$LABEL.log" | head
 cp -f rr-read_bw.1.log "../../$OUTDIR/bw_$LABEL.log" 2>/dev/null || true
 cd ../..
